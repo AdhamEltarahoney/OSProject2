@@ -46,7 +46,7 @@
  } Task;
   
  /*
-  * Thread pool state and synchronization primitives
+ * Thread pool state and synchronization objects
   */
  typedef struct {
      pthread_t threads[MAX_WORKERS];
@@ -78,12 +78,12 @@
   * - Uses minimal critical sections to maximize parallelism
   * - Lock is held ONLY when accessing shared queue state
   * - All expensive operations (I/O, compression) done outside locks
-  * - This allows multiple threads to work concurrently without blocking
+  * - which allows multiple threads to work concurrently without blocking
   * 
-  * Work pattern: Lock -> get task -> unlock -> I/O+compress -> lock -> store -> unlock
+  * Work pattern: Lock -> get task -> unlock -> I/O+compress (parrellelization here) -> lock -> store -> unlock
   * 
   * Memory Management:
-  * - Allocates buffers on heap (not stack) to prevent stack overflow
+  * - Allocates buffers on heap to prevent stack overflow and prevent a use-after-free bug
   * - Frees temporary buffers immediately after use
   * - Only compressed result is kept in memory until final write
   */
@@ -119,19 +119,17 @@
          // END CRITICAL SECTION 1
          
          // Perform I/O and compression OUTSIDE lock for maximum parallelism
-         // Allocate buffers on heap (not stack) to avoid excessive stack usage
+         // Allocate buffers on heap 
          unsigned char *buffer_in = malloc(BUFFER_SIZE);
          unsigned char *buffer_out = malloc(BUFFER_SIZE);
          assert(buffer_in != NULL && buffer_out != NULL);
          
-         // Load file and record original size
-         // KEY OPTIMIZATION: We capture nbytes here, eliminating need for second file open
+         
          FILE *f_in = fopen(full_path, "r");
          assert(f_in != NULL);
          int nbytes = fread(buffer_in, 1, BUFFER_SIZE, f_in);
          fclose(f_in);
          
-         // Compress file using zlib level 9 (maximum compression)
          z_stream strm;
          int ret = deflateInit(&strm, 9);
          assert(ret == Z_OK);
@@ -146,7 +144,7 @@
          int nbytes_zipped = BUFFER_SIZE - strm.avail_out;
          deflateEnd(&strm);
          
-         // Allocate exactly the space needed for compressed data
+         // Allocate the space needed for compressed data
          unsigned char *compressed_data = malloc(nbytes_zipped);
          assert(compressed_data != NULL);
          memcpy(compressed_data, buffer_out, nbytes_zipped);
@@ -160,7 +158,7 @@
          
          pool.results[index].data = compressed_data;
          pool.results[index].comp_size = nbytes_zipped;
-         pool.results[index].orig_size = nbytes;  // Captured during read, no second I/O!
+         pool.results[index].orig_size = nbytes;  // Captured during read, no second I/O (key optimization we made)
          pool.results[index].ready = 1;
          pool.tasks_completed++;
          
@@ -201,10 +199,10 @@
   * 
   * PHASE 3 (Serial): Output
   * - Write compressed results in lexicographical order
-  * - Uses pre-captured file sizes (no second I/O)
+  * - Uses pre-captured file sizes to prevent a second I/O
   * - Order guaranteed by indexed result array
   * 
-  * This design maximizes parallelism while ensuring correctness.
+  * This maximizes parallelism while ensuring correctness as explained in the presentation.
   */
  int compress_directory(char *directory_name) {
      DIR *d;
@@ -219,10 +217,9 @@
          return 0;
      }
      
-     // ========== PHASE 1: Directory Scan and Sort (Serial) ==========
+     //  Phase 1: Directory Scan and Sort (Serial) 
      
      // Collect all .txt files from directory
-     // OPTIMIZATION: Only realloc for .txt files, use geometric growth
      while ((dir = readdir(d)) != NULL) {
          int len = strlen(dir->d_name);
          
@@ -258,9 +255,9 @@
          return 0;
      }
      
-     // ========== PHASE 2: Parallel Compression Setup ==========
+     //  Phase 2: Parallel Compression Setup 
      
-     // Initialize synchronization primitives
+     // Initialize synchronization stuff
      pthread_mutex_init(&pool.mutex, NULL);
      pthread_cond_init(&pool.task_available, NULL);
      pthread_cond_init(&pool.all_done, NULL);
@@ -303,7 +300,7 @@
      pthread_cond_broadcast(&pool.task_available);
      pthread_mutex_unlock(&pool.mutex);
      
-     // ========== PHASE 2: Parallel Compression (Workers Active) ==========
+     //  Phase 2: Parallel Compression (Workers Active) 
      
      // Wait for all compression tasks to complete
      // Workers signal when last task is done
@@ -313,7 +310,7 @@
      }
      pthread_mutex_unlock(&pool.mutex);
      
-     // Gracefully shutdown worker threads
+     //  shutdown worker threads
      pthread_mutex_lock(&pool.mutex);
      pool.shutdown = 1;
      pthread_cond_broadcast(&pool.task_available);
@@ -324,10 +321,10 @@
          pthread_join(pool.threads[i], NULL);
      }
      
-     // ========== PHASE 3: Serial Output (Lexicographical Order) ==========
+     //  Phase 3: Serial Output (Lexicographical Order) 
      
      // Write compressed results to output file
-     // KEY OPTIMIZATION: No file I/O here - all data already in memory!
+     // Optimization: No file I/O here - all data already in memory!
      int total_in = 0, total_out = 0;
      FILE *f_out = fopen("text.tzip", "w");
      assert(f_out != NULL);
@@ -337,7 +334,7 @@
          assert(pool.results[i].ready == 1);
          
          // Accumulate totals using pre-captured sizes
-         // KEY OPTIMIZATION: orig_size was captured during read, no second file open!
+         // OPTIMIZATION: orig_size was captured during read, no second file open!
          total_in += pool.results[i].orig_size;
          total_out += pool.results[i].comp_size;
          
@@ -351,7 +348,6 @@
      }
      fclose(f_out);
      
-     // Report compression statistics
      printf("Compression rate: %.2lf%%\n", 100.0 * (total_in - total_out) / total_in);
      
      // Clean up all remaining allocations and synchronization primitives
